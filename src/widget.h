@@ -1,6 +1,6 @@
 #pragma once
 // A small transparent strip on the taskbar, just left of the notification area, showing
-// "[icon] 30%  [icon] 93%". Implemented as a layered child window of the taskbar (Shell_TrayWnd).
+// "[icon] 30%  [icon] 93%". Implemented as a layered child window of the selected taskbar.
 #include <windows.h>
 #include <string>
 #include <vector>
@@ -17,8 +17,15 @@ struct WidgetItem {
 };
 
 namespace widget {
-// Creates the widget on the primary taskbar. Clicks are reported by posting `clickMsg` to `notifyWnd`.
-bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme);
+struct Monitor {
+    std::wstring device;
+    RECT bounds;
+    bool primary;
+};
+std::vector<Monitor> Monitors();
+// An empty monitor name selects the primary taskbar.
+bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme, const std::wstring& monitor = L"");
+bool OnMonitor(const std::wstring& monitor);
 void Destroy();
 bool Alive();
 void SetItems(const std::vector<WidgetItem>& items, const std::wstring& tooltip);
@@ -26,6 +33,6 @@ void SetLightTheme(bool light);
 // Draws a rounded plate in the taskbar's colours behind the text (kept across Create/Destroy).
 void SetBackground(bool on);
 // Re-checks the taskbar layout and moves the widget if needed; call about once a second.
-// Returns false when the taskbar it was attached to is gone.
+// Returns false when the taskbar is gone or its clock position is not available yet.
 bool Reposition();
 }

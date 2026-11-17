@@ -36,14 +36,33 @@ int Px(int v) { return MulDiv(v, Dpi(), 96); }
 // runs on its own thread, which owns no windows, and the UI thread only reads the last rectangle.
 SRWLOCK g_wbLock = SRWLOCK_INIT;
 RECT g_wbRect{};             // last Widgets button rectangle (screen), empty when unknown
+RECT g_clockRect{};
 HWND g_wbRectBar;            // taskbar g_wbRect was found in (guarded by g_wbLock)
 HWND g_wbTaskbar;            // taskbar to search, null while there is no widget (guarded by g_wbLock)
 HANDLE g_wbWake;             // auto-reset: wakes the lookup thread early
+
+IUIAutomationElement* FindElement(IUIAutomation* uia, HWND bar, const wchar_t* name) {
+    IUIAutomationElement* root = nullptr;
+    IUIAutomationElement* element = nullptr;
+    IUIAutomationCondition* cond = nullptr;
+    VARIANT id;
+    VariantInit(&id);
+    id.vt = VT_BSTR;
+    id.bstrVal = SysAllocString(name);
+    if (SUCCEEDED(uia->ElementFromHandle(bar, &root)) && root &&
+        SUCCEEDED(uia->CreatePropertyCondition(UIA_AutomationIdPropertyId, id, &cond)) && cond)
+        root->FindFirst(TreeScope_Descendants, cond, &element);
+    VariantClear(&id);
+    if (cond) cond->Release();
+    if (root) root->Release();
+    return element;
+}
 
 DWORD WINAPI WidgetsButtonThread(LPVOID) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IUIAutomation* uia = nullptr;
     IUIAutomationElement* btn = nullptr;
+    IUIAutomationElement* clock = nullptr;
     HWND btnBar = nullptr;
     for (;;) {
         WaitForSingleObject(g_wbWake, btnBar ? 5000 : INFINITE);  // no widget (tray-icon mode): sleep until one
@@ -51,34 +70,31 @@ DWORD WINAPI WidgetsButtonThread(LPVOID) {
         HWND bar = g_wbTaskbar;
         ReleaseSRWLockShared(&g_wbLock);
         if (btn && bar != btnBar) { btn->Release(); btn = nullptr; }
+        if (clock && bar != btnBar) { clock->Release(); clock = nullptr; }
         btnBar = bar;
         RECT r{};
+        RECT cr{};
         if (bar && IsWindow(bar)) {
             if (!uia)
                 CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation), (void**)&uia);
-            if (uia && !btn) {
-                IUIAutomationElement* root = nullptr;
-                IUIAutomationCondition* cond = nullptr;
-                VARIANT id;
-                VariantInit(&id);
-                id.vt = VT_BSTR;
-                id.bstrVal = SysAllocString(L"WidgetsButton");
-                if (SUCCEEDED(uia->ElementFromHandle(bar, &root)) && root &&
-                    SUCCEEDED(uia->CreatePropertyCondition(UIA_AutomationIdPropertyId, id, &cond)) && cond)
-                    root->FindFirst(TreeScope_Descendants, cond, &btn);
-                VariantClear(&id);
-                if (cond) cond->Release();
-                if (root) root->Release();
-            }
+            if (uia && !btn) btn = FindElement(uia, bar, L"WidgetsButton");
+            if (uia && !clock && !FindWindowExW(bar, nullptr, L"TrayNotifyWnd", nullptr))
+                clock = FindElement(uia, bar, L"SystemTrayIcon");
             if (btn && FAILED(btn->get_CurrentBoundingRectangle(&r))) {
                 btn->Release();  // stale (Widgets turned off, Explorer restarted): look it up again next time
                 btn = nullptr;
                 r = {};
             }
+            if (clock && FAILED(clock->get_CurrentBoundingRectangle(&cr))) {
+                clock->Release();
+                clock = nullptr;
+                cr = {};
+            }
         }
         AcquireSRWLockExclusive(&g_wbLock);
         if (bar && g_wbTaskbar == bar) {  // drop a result for a taskbar we no longer sit on
             g_wbRect = r;
+            g_clockRect = cr;
             g_wbRectBar = bar;
         }
         ReleaseSRWLockExclusive(&g_wbLock);
@@ -106,6 +122,28 @@ RECT WidgetsButtonRect() {
     RECT r = g_wbRectBar && g_wbRectBar == g_wbTaskbar ? g_wbRect : RECT{};
     ReleaseSRWLockShared(&g_wbLock);
     return r;
+}
+
+RECT ClockRect() {
+    AcquireSRWLockShared(&g_wbLock);
+    RECT r = g_wbRectBar && g_wbRectBar == g_wbTaskbar ? g_clockRect : RECT{};
+    ReleaseSRWLockShared(&g_wbLock);
+    return r;
+}
+
+HWND TaskbarFor(const std::wstring& device) {
+    HWND primary = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (device.empty()) return primary;
+    for (const wchar_t* cls : { L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd" }) {
+        HWND bar = nullptr;
+        while ((bar = FindWindowExW(nullptr, bar, cls, nullptr))) {
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(MonitorFromWindow(bar, MONITOR_DEFAULTTONULL), &mi) &&
+                device == mi.szDevice) return bar;
+        }
+    }
+    return primary;
 }
 
 void ApplyTipTheme() {
@@ -332,10 +370,28 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 namespace widget {
 
-bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme) {
+std::vector<Monitor> Monitors() {
+    std::vector<Monitor> monitors;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(monitor, &mi))
+            reinterpret_cast<std::vector<Monitor>*>(data)->push_back(
+                { mi.szDevice, mi.rcMonitor, (mi.dwFlags & MONITORINFOF_PRIMARY) != 0 });
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&monitors));
+    std::sort(monitors.begin(), monitors.end(), [](const Monitor& a, const Monitor& b) {
+        return a.device < b.device;
+    });
+    return monitors;
+}
+
+bool OnMonitor(const std::wstring& monitor) { return g_taskbar == TaskbarFor(monitor); }
+
+bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme, const std::wstring& monitor) {
     Destroy();
-    g_taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (!g_taskbar || !FindWindowExW(g_taskbar, nullptr, L"TrayNotifyWnd", nullptr)) { g_taskbar = nullptr; return false; }
+    g_taskbar = TaskbarFor(monitor);
+    if (!g_taskbar) return false;
     RECT tb;
     GetWindowRect(g_taskbar, &tb);
     if (tb.bottom - tb.top > tb.right - tb.left) { g_taskbar = nullptr; return false; }  // vertical taskbar: use tray icons
@@ -380,7 +436,6 @@ bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme) {
     Paint();
     g_lastW = -1;
     Reposition();
-    ShowWindow(g_wnd, SW_SHOWNOACTIVATE);
     return true;
 }
 
@@ -430,10 +485,21 @@ bool Reposition() {
     if (!Alive()) return false;
     if (Dpi() != g_lastDpi) { g_lastDpi = Dpi(); Paint(); }
     HWND tray = FindWindowExW(g_taskbar, nullptr, L"TrayNotifyWnd", nullptr);
-    if (!tray) return true;
-    RECT tr, bar;
-    GetWindowRect(tray, &tr);
+    RECT tr{}, bar;
     GetWindowRect(g_taskbar, &bar);
+    if (tray) GetWindowRect(tray, &tr);
+    else {
+        HWND clock = FindWindowExW(g_taskbar, nullptr, L"ClockButton", nullptr);
+        if (!clock) clock = FindWindowExW(g_taskbar, nullptr, L"TrayClockWClass", nullptr);
+        if (clock) GetWindowRect(clock, &tr);
+        else tr = ClockRect();
+        if (tr.right <= tr.left || tr.bottom <= bar.top || tr.top >= bar.bottom) {
+            // The secondary clock is XAML on Windows 11; wait for its asynchronous lookup.
+            ShowWindow(g_wnd, SW_HIDE);
+            g_lastW = -1;
+            return false;
+        }
+    }
     // Right-to-left Windows (Hebrew, Arabic) mirrors the taskbar: client x runs from the screen's right
     // edge, so a window's client-space left edge is its screen-space right edge.
     bool rtl = GetWindowLongW(g_taskbar, GWL_EXSTYLE) & WS_EX_LAYOUTRTL;

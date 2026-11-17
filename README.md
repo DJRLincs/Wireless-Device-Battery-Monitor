@@ -30,6 +30,7 @@ Battery levels of your wireless mouse, headset, keyboard and controller, right o
 - **Charging:** a blue ⚡ appears next to the number.
 - **Asleep:** dimmed text means the device is asleep and the last known value is shown.
 - **Theme:** it follows light/dark mode and DPI scaling.
+- **Monitor:** choose *Widget monitor* in the menu to move the widget to another monitor's taskbar. The selection is remembered. Enable Windows' taskbar on that monitor; if it is unavailable, the widget uses the primary taskbar until it returns. Tray icons remain available while Windows' clock position cannot be determined.
 - **Transparent taskbar themes** (e.g. Windhawk's Taskbar Styler): turn on *Background behind taskbar text* in the menu to keep the text readable over the wallpaper.
 
 **Tray icons:** one icon per device with the number drawn in it, plus a "Low battery" notification at 15%. The app switches to this automatically when the taskbar is vertical or can't be found.
